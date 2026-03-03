@@ -38,5 +38,13 @@ jobs:
         run: |
           set -euo pipefail
           api="https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/remote_mirror/pull"
-          response="$(curl -fsS -X POST "${api}?access_token=${GITEE_TOKEN}")"
-          echo "Gitee response: ${response}"
+          tmp="$(mktemp)"
+          code="$(curl -sS -o "${tmp}" -w "%{http_code}" -X POST "${api}?access_token=${GITEE_TOKEN}")"
+          echo "Gitee response HTTP ${code}:"
+          cat "${tmp}"
+          if [[ "${code}" != 2* ]]; then
+            echo "Failed to trigger Gitee remote mirror pull. Confirm this repository has Pull mirror configured in Gitee." >&2
+            rm -f "${tmp}"
+            exit 1
+          fi
+          rm -f "${tmp}"
