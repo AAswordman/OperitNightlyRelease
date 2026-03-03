@@ -1,7 +1,6 @@
 name: Sync GitHub To Gitee
 
 on:
-  push:
   delete:
   release:
     types:
@@ -85,4 +84,3 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           bash .github/scripts/sync-release-to-gitee.sh all
-
