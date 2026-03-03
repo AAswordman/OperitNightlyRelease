@@ -4,6 +4,16 @@ set -euo pipefail
 MODE="${1:-latest}"
 TARGET_TAG="${2:-${SYNC_TAG:-}}"
 
+# Gitee variable naming has restrictions; support alias variables in CI.
+if [[ -z "${GITEE_TOKEN:-}" ]]; then
+  if [[ -n "${REL_SYNC_TOKEN:-}" ]]; then
+    GITEE_TOKEN="${REL_SYNC_TOKEN}"
+  elif [[ -n "${SYNC_GITEE_TOKEN:-}" ]]; then
+    GITEE_TOKEN="${SYNC_GITEE_TOKEN}"
+  fi
+fi
+export GITEE_TOKEN
+
 required_env=(
   GITEE_OWNER
   GITEE_REPO
