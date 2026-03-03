@@ -5,6 +5,9 @@ triggers:
   trigger: auto
   schedule:
     - cron: '0 */5 * * * ? *'
+variables:
+  global:
+    - REL_SYNC_TOKEN
 stages:
   - name: sync_release
     displayName: Sync Release Assets
