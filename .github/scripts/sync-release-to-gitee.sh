@@ -42,13 +42,19 @@ fi
 API_BASE="https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}"
 GH_API_BASE="https://api.github.com/repos/${SOURCE_GITHUB_REPOSITORY}"
 GH_RELEASE_MIRROR_PREFIXES_RAW="${GH_RELEASE_MIRROR_PREFIXES:-}"
+SYNC_ASSET_CONCURRENCY="${SYNC_ASSET_CONCURRENCY:-4}"
+
+if ! [[ "${SYNC_ASSET_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SYNC_ASSET_CONCURRENCY must be a positive integer." >&2
+  exit 1
+fi
 
 if [[ -n "${GH_RELEASE_MIRROR_PREFIXES_RAW}" ]]; then
   IFS=',;' read -r -a GH_RELEASE_MIRROR_PREFIX_LIST <<<"${GH_RELEASE_MIRROR_PREFIXES_RAW}"
 else
   GH_RELEASE_MIRROR_PREFIX_LIST=(
-    "https://flash.aaswordsman.org/"
     "https://ghfast.top/"
+    "https://flash.aaswordsman.org/"
   )
 fi
 
@@ -57,6 +63,7 @@ echo "Target Gitee repository: ${GITEE_OWNER}/${GITEE_REPO}"
 if [[ "${#GH_RELEASE_MIRROR_PREFIX_LIST[@]}" -gt 0 ]]; then
   echo "GitHub asset mirrors: ${GH_RELEASE_MIRROR_PREFIX_LIST[*]}"
 fi
+echo "Asset sync concurrency: ${SYNC_ASSET_CONCURRENCY}"
 
 urlencode() {
   jq -rn --arg v "$1" '$v|@uri'
@@ -172,16 +179,53 @@ gitee_release_id_by_tag() {
   return 1
 }
 
+sync_one_asset() {
+  local release_id="$1"
+  local asset_name="$2"
+  local asset_url="$3"
+  local tmp_file
+
+  tmp_file="$(mktemp)"
+  echo "Downloading GitHub asset: ${asset_name}"
+  if ! gh_download_asset "${asset_url}" "${tmp_file}"; then
+    rm -f "${tmp_file}"
+    echo "Failed to download asset: ${asset_name}" >&2
+    return 1
+  fi
+
+  echo "Uploading asset to Gitee: ${asset_name}"
+  if ! curl -fsS -X POST "${API_BASE}/releases/${release_id}/attach_files" \
+    --form "access_token=${GITEE_TOKEN}" \
+    --form "file=@${tmp_file};filename=${asset_name}" >/dev/null; then
+    rm -f "${tmp_file}"
+    echo "Failed to upload asset: ${asset_name}" >&2
+    return 1
+  fi
+
+  rm -f "${tmp_file}"
+  return 0
+}
+
 sync_release_assets() {
   local release_id="$1"
   local release_json="$2"
-  local tmp_assets
+  local tmp_assets supports_wait_n running_jobs failed
+  local -a pids
+
+  supports_wait_n=0
+  running_jobs=0
+  failed=0
+  pids=()
+  if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
+    supports_wait_n=1
+  fi
+
   tmp_assets="$(mktemp)"
   curl -sS "${API_BASE}/releases/${release_id}/attach_files?access_token=${GITEE_TOKEN}" > "${tmp_assets}"
 
   while IFS= read -r asset; do
     [[ -z "${asset}" ]] && continue
-    local asset_name asset_url tmp_file
+    local asset_name asset_url
     asset_name="$(jq -r '.name // empty' <<<"${asset}")"
     asset_url="$(jq -r '.browser_download_url // empty' <<<"${asset}")"
 
@@ -194,19 +238,48 @@ sync_release_assets() {
       continue
     fi
 
-    tmp_file="$(mktemp)"
-    echo "Downloading GitHub asset: ${asset_name}"
-    gh_download_asset "${asset_url}" "${tmp_file}"
+    sync_one_asset "${release_id}" "${asset_name}" "${asset_url}" &
+    pids+=("$!")
+    running_jobs=$((running_jobs + 1))
 
-    echo "Uploading asset to Gitee: ${asset_name}"
-    curl -sS -X POST "${API_BASE}/releases/${release_id}/attach_files" \
-      --form "access_token=${GITEE_TOKEN}" \
-      --form "file=@${tmp_file};filename=${asset_name}" >/dev/null
-
-    rm -f "${tmp_file}"
+    if (( running_jobs >= SYNC_ASSET_CONCURRENCY )); then
+      if (( supports_wait_n == 1 )); then
+        if ! wait -n; then
+          failed=1
+        fi
+      else
+        local first_pid
+        first_pid="${pids[0]}"
+        pids=("${pids[@]:1}")
+        if ! wait "${first_pid}"; then
+          failed=1
+        fi
+      fi
+      running_jobs=$((running_jobs - 1))
+    fi
   done < <(jq -c '.assets[]?' <<<"${release_json}")
 
+  if (( supports_wait_n == 1 )); then
+    while (( running_jobs > 0 )); do
+      if ! wait -n; then
+        failed=1
+      fi
+      running_jobs=$((running_jobs - 1))
+    done
+  else
+    local pid
+    for pid in "${pids[@]}"; do
+      if ! wait "${pid}"; then
+        failed=1
+      fi
+    done
+  fi
+
   rm -f "${tmp_assets}"
+  if (( failed != 0 )); then
+    echo "One or more asset sync jobs failed." >&2
+    exit 1
+  fi
 }
 
 upsert_gitee_release_from_json() {
