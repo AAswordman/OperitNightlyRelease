@@ -43,9 +43,34 @@ API_BASE="https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}"
 GH_API_BASE="https://api.github.com/repos/${SOURCE_GITHUB_REPOSITORY}"
 GH_RELEASE_MIRROR_PREFIXES_RAW="${GH_RELEASE_MIRROR_PREFIXES:-}"
 SYNC_ASSET_CONCURRENCY="${SYNC_ASSET_CONCURRENCY:-4}"
+SYNC_DOWNLOAD_STALL_SECONDS="${SYNC_DOWNLOAD_STALL_SECONDS:-5}"
+SYNC_DOWNLOAD_CONNECT_TIMEOUT="${SYNC_DOWNLOAD_CONNECT_TIMEOUT:-8}"
+SYNC_DOWNLOAD_PROBE_TIMEOUT="${SYNC_DOWNLOAD_PROBE_TIMEOUT:-8}"
+SYNC_DOWNLOAD_PROBE_BYTES="${SYNC_DOWNLOAD_PROBE_BYTES:-262144}"
+SYNC_DOWNLOAD_MAX_ROUNDS="${SYNC_DOWNLOAD_MAX_ROUNDS:-12}"
 
 if ! [[ "${SYNC_ASSET_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
   echo "SYNC_ASSET_CONCURRENCY must be a positive integer." >&2
+  exit 1
+fi
+if ! [[ "${SYNC_DOWNLOAD_STALL_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SYNC_DOWNLOAD_STALL_SECONDS must be a positive integer." >&2
+  exit 1
+fi
+if ! [[ "${SYNC_DOWNLOAD_CONNECT_TIMEOUT}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SYNC_DOWNLOAD_CONNECT_TIMEOUT must be a positive integer." >&2
+  exit 1
+fi
+if ! [[ "${SYNC_DOWNLOAD_PROBE_TIMEOUT}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SYNC_DOWNLOAD_PROBE_TIMEOUT must be a positive integer." >&2
+  exit 1
+fi
+if ! [[ "${SYNC_DOWNLOAD_PROBE_BYTES}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SYNC_DOWNLOAD_PROBE_BYTES must be a positive integer." >&2
+  exit 1
+fi
+if ! [[ "${SYNC_DOWNLOAD_MAX_ROUNDS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SYNC_DOWNLOAD_MAX_ROUNDS must be a positive integer." >&2
   exit 1
 fi
 
@@ -53,6 +78,7 @@ if [[ -n "${GH_RELEASE_MIRROR_PREFIXES_RAW}" ]]; then
   IFS=',;' read -r -a GH_RELEASE_MIRROR_PREFIX_LIST <<<"${GH_RELEASE_MIRROR_PREFIXES_RAW}"
 else
   GH_RELEASE_MIRROR_PREFIX_LIST=(
+    "https://gh-proxy.com/"
     "https://ghfast.top/"
     "https://flash.aaswordsman.org/"
   )
@@ -64,6 +90,11 @@ if [[ "${#GH_RELEASE_MIRROR_PREFIX_LIST[@]}" -gt 0 ]]; then
   echo "GitHub asset mirrors: ${GH_RELEASE_MIRROR_PREFIX_LIST[*]}"
 fi
 echo "Asset sync concurrency: ${SYNC_ASSET_CONCURRENCY}"
+echo "Download stall seconds: ${SYNC_DOWNLOAD_STALL_SECONDS}"
+echo "Download connect timeout: ${SYNC_DOWNLOAD_CONNECT_TIMEOUT}"
+echo "Download probe timeout: ${SYNC_DOWNLOAD_PROBE_TIMEOUT}"
+echo "Download probe bytes: ${SYNC_DOWNLOAD_PROBE_BYTES}"
+echo "Download max rounds: ${SYNC_DOWNLOAD_MAX_ROUNDS}"
 
 urlencode() {
   jq -rn --arg v "$1" '$v|@uri'
@@ -101,44 +132,140 @@ gh_api_get_json() {
   rm -f "${tmp}"
 }
 
-gh_download_asset() {
+is_github_direct_url() {
   local url="$1"
-  local out="$2"
-  local attempt=0
-  local download_url
+  [[ "${url}" == https://github.com/* || "${url}" == https://api.github.com/* || "${url}" == https://objects.githubusercontent.com/* || "${url}" == https://*.githubusercontent.com/* ]]
+}
 
-  while IFS= read -r download_url; do
-    [[ -z "${download_url}" ]] && continue
-    attempt=$((attempt + 1))
-    echo "Download attempt ${attempt}: ${download_url}"
+file_size_bytes() {
+  local path="$1"
+  if [[ -f "${path}" ]]; then
+    wc -c < "${path}" | tr -d '[:space:]'
+  else
+    echo "0"
+  fi
+}
 
-    if gh_download_asset_once "${download_url}" "${out}"; then
-      return 0
+probe_download_speed() {
+  local url="$1"
+  local probe_end raw code speed speed_int
+  probe_end=$((SYNC_DOWNLOAD_PROBE_BYTES - 1))
+
+  if [[ -n "${GITHUB_TOKEN:-}" ]] && is_github_direct_url "${url}"; then
+    raw="$(
+      curl -L -sS -o /dev/null \
+        --connect-timeout "${SYNC_DOWNLOAD_PROBE_TIMEOUT}" \
+        --max-time "${SYNC_DOWNLOAD_PROBE_TIMEOUT}" \
+        --range "0-${probe_end}" \
+        -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+        -H "Accept: application/octet-stream" \
+        -w "%{http_code} %{speed_download}" \
+        "${url}" 2>/dev/null || true
+    )"
+  else
+    raw="$(
+      curl -L -sS -o /dev/null \
+        --connect-timeout "${SYNC_DOWNLOAD_PROBE_TIMEOUT}" \
+        --max-time "${SYNC_DOWNLOAD_PROBE_TIMEOUT}" \
+        --range "0-${probe_end}" \
+        -H "Accept: application/octet-stream" \
+        -w "%{http_code} %{speed_download}" \
+        "${url}" 2>/dev/null || true
+    )"
+  fi
+
+  code="${raw%% *}"
+  speed="${raw#* }"
+  if [[ "${code}" =~ ^2[0-9][0-9]$ ]]; then
+    speed_int="${speed%.*}"
+    if [[ -z "${speed_int}" || ! "${speed_int}" =~ ^[0-9]+$ ]]; then
+      speed_int=0
     fi
-
-    echo "Download attempt ${attempt} failed"
-  done < <(build_asset_download_candidates "${url}")
-
-  echo "All download attempts failed: ${url}" >&2
-  return 1
+    echo "${speed_int}"
+  else
+    echo "0"
+  fi
 }
 
 gh_download_asset_once() {
   local url="$1"
   local out="$2"
 
-  if [[ -n "${GITHUB_TOKEN:-}" ]] && [[ "${url}" == https://github.com/* || "${url}" == https://api.github.com/* || "${url}" == https://objects.githubusercontent.com/* || "${url}" == https://*.githubusercontent.com/* ]]; then
-    curl -fsSL --retry 4 --retry-all-errors --retry-delay 2 \
+  if [[ -n "${GITHUB_TOKEN:-}" ]] && is_github_direct_url "${url}"; then
+    curl -fsSL \
+      --connect-timeout "${SYNC_DOWNLOAD_CONNECT_TIMEOUT}" \
+      --speed-time "${SYNC_DOWNLOAD_STALL_SECONDS}" \
+      --speed-limit 1 \
       -H "Authorization: Bearer ${GITHUB_TOKEN}" \
       -H "Accept: application/octet-stream" \
+      -C - \
+      -o "${out}" \
       -L "${url}" \
-      -o "${out}"
+      >/dev/null
   else
-    curl -fsSL --retry 4 --retry-all-errors --retry-delay 2 \
+    curl -fsSL \
+      --connect-timeout "${SYNC_DOWNLOAD_CONNECT_TIMEOUT}" \
+      --speed-time "${SYNC_DOWNLOAD_STALL_SECONDS}" \
+      --speed-limit 1 \
       -H "Accept: application/octet-stream" \
+      -C - \
+      -o "${out}" \
       -L "${url}" \
-      -o "${out}"
+      >/dev/null
   fi
+}
+
+gh_download_asset() {
+  local url="$1"
+  local out="$2"
+  local expected_size="${3:-0}"
+  local round best_url best_speed speed candidate resume_from actual_size
+  local -a candidates
+
+  touch "${out}"
+  for ((round = 1; round <= SYNC_DOWNLOAD_MAX_ROUNDS; round++)); do
+    mapfile -t candidates < <(build_asset_download_candidates "${url}")
+    if [[ "${#candidates[@]}" -eq 0 ]]; then
+      echo "No download candidates found: ${url}" >&2
+      return 1
+    fi
+
+    best_url=""
+    best_speed=-1
+    echo "Probe round ${round}: selecting fastest source"
+    for candidate in "${candidates[@]}"; do
+      [[ -z "${candidate}" ]] && continue
+      speed="$(probe_download_speed "${candidate}")"
+      echo "Probe result: speed=${speed}B/s url=${candidate}"
+      if (( speed > best_speed )); then
+        best_speed="${speed}"
+        best_url="${candidate}"
+      fi
+    done
+
+    if [[ -z "${best_url}" ]]; then
+      echo "Probe round ${round}: all candidates unavailable." >&2
+      continue
+    fi
+
+    resume_from="$(file_size_bytes "${out}")"
+    echo "Download round ${round}: ${best_url} (resume_from=${resume_from})"
+    if gh_download_asset_once "${best_url}" "${out}"; then
+      if [[ "${expected_size}" =~ ^[0-9]+$ ]] && (( expected_size > 0 )); then
+        actual_size="$(file_size_bytes "${out}")"
+        if (( actual_size < expected_size )); then
+          echo "Partial file after round ${round}: ${actual_size}/${expected_size}, continue with resume."
+          continue
+        fi
+      fi
+      return 0
+    fi
+
+    echo "Download round ${round} failed, re-probing and resuming."
+  done
+
+  echo "All download rounds failed: ${url}" >&2
+  return 1
 }
 
 build_asset_download_candidates() {
@@ -183,11 +310,12 @@ sync_one_asset() {
   local release_id="$1"
   local asset_name="$2"
   local asset_url="$3"
+  local asset_size="${4:-0}"
   local tmp_file
 
   tmp_file="$(mktemp)"
-  echo "Downloading GitHub asset: ${asset_name}"
-  if ! gh_download_asset "${asset_url}" "${tmp_file}"; then
+  echo "Downloading GitHub asset: ${asset_name} (size=${asset_size})"
+  if ! gh_download_asset "${asset_url}" "${tmp_file}" "${asset_size}"; then
     rm -f "${tmp_file}"
     echo "Failed to download asset: ${asset_name}" >&2
     return 1
@@ -225,9 +353,10 @@ sync_release_assets() {
 
   while IFS= read -r asset; do
     [[ -z "${asset}" ]] && continue
-    local asset_name asset_url
+    local asset_name asset_url asset_size
     asset_name="$(jq -r '.name // empty' <<<"${asset}")"
     asset_url="$(jq -r '.browser_download_url // empty' <<<"${asset}")"
+    asset_size="$(jq -r '.size // 0' <<<"${asset}")"
 
     if [[ -z "${asset_name}" || -z "${asset_url}" ]]; then
       continue
@@ -238,7 +367,7 @@ sync_release_assets() {
       continue
     fi
 
-    sync_one_asset "${release_id}" "${asset_name}" "${asset_url}" &
+    sync_one_asset "${release_id}" "${asset_name}" "${asset_url}" "${asset_size}" &
     pids+=("$!")
     running_jobs=$((running_jobs + 1))
 
