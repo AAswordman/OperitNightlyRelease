@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODE="${1:-single}"
+MODE="${1:-latest}"
+TARGET_TAG="${2:-${SYNC_TAG:-}}"
 
 required_env=(
   GITEE_OWNER
   GITEE_REPO
   GITEE_TOKEN
-  GITHUB_TOKEN
-  GITHUB_REPOSITORY
 )
 
 for key in "${required_env[@]}"; do
@@ -18,11 +17,71 @@ for key in "${required_env[@]}"; do
   fi
 done
 
+SOURCE_GITHUB_REPOSITORY="${SOURCE_GITHUB_REPOSITORY:-${GITHUB_REPOSITORY:-}}"
+if [[ -z "${SOURCE_GITHUB_REPOSITORY}" ]]; then
+  echo "Missing SOURCE_GITHUB_REPOSITORY (or GITHUB_REPOSITORY)." >&2
+  echo "Expected format: owner/repo" >&2
+  exit 1
+fi
+
 API_BASE="https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}"
-GH_API_BASE="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+GH_API_BASE="https://api.github.com/repos/${SOURCE_GITHUB_REPOSITORY}"
+
+echo "Source GitHub repository: ${SOURCE_GITHUB_REPOSITORY}"
+echo "Target Gitee repository: ${GITEE_OWNER}/${GITEE_REPO}"
 
 urlencode() {
   jq -rn --arg v "$1" '$v|@uri'
+}
+
+gh_api_get_code() {
+  local url="$1"
+  local out="$2"
+
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    curl -sS -L -o "${out}" -w "%{http_code}" \
+      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+      -H "Accept: application/vnd.github+json" \
+      "${url}"
+  else
+    curl -sS -L -o "${out}" -w "%{http_code}" \
+      -H "Accept: application/vnd.github+json" \
+      "${url}"
+  fi
+}
+
+gh_api_get_json() {
+  local url="$1"
+  local tmp code
+
+  tmp="$(mktemp)"
+  code="$(gh_api_get_code "${url}" "${tmp}")"
+  if [[ "${code}" != "200" ]]; then
+    echo "GitHub API request failed: ${url} (HTTP ${code})" >&2
+    cat "${tmp}" >&2
+    rm -f "${tmp}"
+    exit 1
+  fi
+  cat "${tmp}"
+  rm -f "${tmp}"
+}
+
+gh_download_asset() {
+  local url="$1"
+  local out="$2"
+
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    curl -fsSL --retry 4 --retry-all-errors --retry-delay 2 \
+      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+      -H "Accept: application/octet-stream" \
+      -L "${url}" \
+      -o "${out}"
+  else
+    curl -fsSL --retry 4 --retry-all-errors --retry-delay 2 \
+      -H "Accept: application/octet-stream" \
+      -L "${url}" \
+      -o "${out}"
+  fi
 }
 
 gitee_release_id_by_tag() {
@@ -43,17 +102,6 @@ gitee_release_id_by_tag() {
   return 1
 }
 
-delete_gitee_release_by_tag() {
-  local tag="$1"
-  local rid
-  if rid="$(gitee_release_id_by_tag "${tag}")"; then
-    echo "Deleting Gitee release tag=${tag} id=${rid}"
-    curl -sS -X DELETE "${API_BASE}/releases/${rid}?access_token=${GITEE_TOKEN}" >/dev/null
-  else
-    echo "Gitee release tag=${tag} does not exist; skip delete"
-  fi
-}
-
 sync_release_assets() {
   local release_id="$1"
   local release_json="$2"
@@ -61,26 +109,24 @@ sync_release_assets() {
   tmp_assets="$(mktemp)"
   curl -sS "${API_BASE}/releases/${release_id}/attach_files?access_token=${GITEE_TOKEN}" > "${tmp_assets}"
 
-  while IFS= read -r aid; do
-    [[ -z "${aid}" ]] && continue
-    curl -sS -X DELETE "${API_BASE}/releases/${release_id}/attach_files/${aid}?access_token=${GITEE_TOKEN}" >/dev/null
-  done < <(jq -r 'if type=="array" then .[].id else empty end' "${tmp_assets}")
-
-  rm -f "${tmp_assets}"
-
   while IFS= read -r asset; do
     [[ -z "${asset}" ]] && continue
     local asset_name asset_url tmp_file
-    asset_name="$(jq -r '.name' <<<"${asset}")"
-    asset_url="$(jq -r '.browser_download_url' <<<"${asset}")"
-    tmp_file="$(mktemp)"
+    asset_name="$(jq -r '.name // empty' <<<"${asset}")"
+    asset_url="$(jq -r '.browser_download_url // empty' <<<"${asset}")"
 
+    if [[ -z "${asset_name}" || -z "${asset_url}" ]]; then
+      continue
+    fi
+
+    if jq -e --arg n "${asset_name}" 'if type=="array" then any(.[]; .name == $n) else false end' "${tmp_assets}" >/dev/null; then
+      echo "Asset already exists on Gitee, skip: ${asset_name}"
+      continue
+    fi
+
+    tmp_file="$(mktemp)"
     echo "Downloading GitHub asset: ${asset_name}"
-    curl -fsSL \
-      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-      -H "Accept: application/octet-stream" \
-      -L "${asset_url}" \
-      -o "${tmp_file}"
+    gh_download_asset "${asset_url}" "${tmp_file}"
 
     echo "Uploading asset to Gitee: ${asset_name}"
     curl -sS -X POST "${API_BASE}/releases/${release_id}/attach_files" \
@@ -89,6 +135,8 @@ sync_release_assets() {
 
     rm -f "${tmp_file}"
   done < <(jq -c '.assets[]?' <<<"${release_json}")
+
+  rm -f "${tmp_assets}"
 }
 
 upsert_gitee_release_from_json() {
@@ -142,41 +190,55 @@ upsert_gitee_release_from_json() {
   sync_release_assets "${rid}" "${release_json}"
 }
 
-sync_single_release_event() {
-  local event_path action release_json tag
-  event_path="${GITHUB_EVENT_PATH:-}"
-  if [[ -z "${event_path}" || ! -f "${event_path}" ]]; then
-    echo "GITHUB_EVENT_PATH is missing or invalid" >&2
-    exit 1
-  fi
+sync_release_by_tag() {
+  local tag="$1"
+  local tag_q tmp code release_json
 
-  action="$(jq -r '.action // empty' "${event_path}")"
-  release_json="$(jq -c '.release // {}' "${event_path}")"
-  tag="$(jq -r '.release.tag_name // empty' "${event_path}")"
-
-  if [[ -z "${tag}" ]]; then
-    echo "No release tag in event payload; skip"
+  tag_q="$(urlencode "${tag}")"
+  tmp="$(mktemp)"
+  code="$(gh_api_get_code "${GH_API_BASE}/releases/tags/${tag_q}" "${tmp}")"
+  if [[ "${code}" == "404" ]]; then
+    echo "GitHub release not found for tag=${tag}, skip"
+    rm -f "${tmp}"
     return 0
   fi
+  if [[ "${code}" != "200" ]]; then
+    echo "Failed to query GitHub release by tag=${tag} (HTTP ${code})" >&2
+    cat "${tmp}" >&2
+    rm -f "${tmp}"
+    exit 1
+  fi
+  release_json="$(cat "${tmp}")"
+  rm -f "${tmp}"
+  upsert_gitee_release_from_json "${release_json}"
+}
 
-  case "${action}" in
-    deleted|unpublished)
-      delete_gitee_release_by_tag "${tag}"
-      ;;
-    *)
-      upsert_gitee_release_from_json "${release_json}"
-      ;;
-  esac
+sync_latest_release() {
+  local tmp code release_json
+
+  tmp="$(mktemp)"
+  code="$(gh_api_get_code "${GH_API_BASE}/releases/latest" "${tmp}")"
+  if [[ "${code}" == "404" ]]; then
+    echo "No GitHub release found, skip"
+    rm -f "${tmp}"
+    return 0
+  fi
+  if [[ "${code}" != "200" ]]; then
+    echo "Failed to query latest GitHub release (HTTP ${code})" >&2
+    cat "${tmp}" >&2
+    rm -f "${tmp}"
+    exit 1
+  fi
+  release_json="$(cat "${tmp}")"
+  rm -f "${tmp}"
+  upsert_gitee_release_from_json "${release_json}"
 }
 
 sync_all_releases() {
   local page response count
   page=1
   while true; do
-    response="$(curl -fsSL \
-      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-      -H "Accept: application/vnd.github+json" \
-      "${GH_API_BASE}/releases?per_page=100&page=${page}")"
+    response="$(gh_api_get_json "${GH_API_BASE}/releases?per_page=100&page=${page}")"
     count="$(jq 'length' <<<"${response}")"
     if [[ "${count}" -eq 0 ]]; then
       break
@@ -192,14 +254,21 @@ sync_all_releases() {
 }
 
 case "${MODE}" in
-  single)
-    sync_single_release_event
+  latest)
+    sync_latest_release
+    ;;
+  tag)
+    if [[ -z "${TARGET_TAG}" ]]; then
+      echo "Missing tag. Usage: sync-release-to-gitee.sh tag <tag>" >&2
+      exit 1
+    fi
+    sync_release_by_tag "${TARGET_TAG}"
     ;;
   all)
     sync_all_releases
     ;;
   *)
-    echo "Unsupported mode: ${MODE}. Use 'single' or 'all'." >&2
+    echo "Unsupported mode: ${MODE}. Use 'latest', 'tag', or 'all'." >&2
     exit 1
     ;;
 esac

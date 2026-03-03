@@ -11,12 +11,6 @@ on:
       - deleted
       - unpublished
   workflow_dispatch:
-    inputs:
-      sync_all_releases:
-        description: "Sync all historical GitHub releases to Gitee"
-        type: boolean
-        default: true
-        required: false
   schedule:
     - cron: "27 3 * * *"
 
@@ -24,16 +18,13 @@ concurrency:
   group: sync-gitee-${{ github.repository }}
   cancel-in-progress: false
 
-permissions:
-  contents: read
-
 env:
   GITEE_OWNER: ${{ vars.GITEE_OWNER }}
   GITEE_REPO: ${{ vars.GITEE_REPO }}
   GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
 
 jobs:
-  mirror-repository:
+  trigger-gitee-mirror-pull:
     runs-on: ubuntu-latest
     steps:
       - name: Validate required settings
@@ -43,44 +34,9 @@ jobs:
           test -n "${GITEE_REPO}"
           test -n "${GITEE_TOKEN}"
 
-      - name: Mirror all refs to Gitee
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Trigger Gitee remote mirror pull
         run: |
           set -euo pipefail
-          git clone --mirror "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo.git
-          cd repo.git
-          git remote add gitee "https://oauth2:${GITEE_TOKEN}@gitee.com/${GITEE_OWNER}/${GITEE_REPO}.git"
-          git push --mirror gitee
-
-  sync-release-event:
-    if: github.event_name == 'release'
-    runs-on: ubuntu-latest
-    needs: mirror-repository
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Sync current release event to Gitee
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          bash .github/scripts/sync-release-to-gitee.sh single
-
-  sync-all-releases:
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.sync_all_releases)
-    runs-on: ubuntu-latest
-    needs: mirror-repository
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Sync all GitHub releases to Gitee
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          bash .github/scripts/sync-release-to-gitee.sh all
+          api="https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/remote_mirror/pull"
+          response="$(curl -fsS -X POST "${api}?access_token=${GITEE_TOKEN}")"
+          echo "Gitee response: ${response}"
