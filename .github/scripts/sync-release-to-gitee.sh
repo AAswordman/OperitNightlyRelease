@@ -10,6 +10,11 @@ if [[ -z "${GITEE_TOKEN:-}" ]]; then
     GITEE_TOKEN="${REL_SYNC_TOKEN}"
   elif [[ -n "${SYNC_GITEE_TOKEN:-}" ]]; then
     GITEE_TOKEN="${SYNC_GITEE_TOKEN}"
+  elif [[ -n "${SYSTEM_FILE_PARAMETER_CACHE:-}" && -f "${SYSTEM_FILE_PARAMETER_CACHE}" ]] && command -v jq >/dev/null 2>&1; then
+    GITEE_TOKEN="$(
+      jq -r '.. | objects | (.GITEE_TOKEN? // .REL_SYNC_TOKEN? // empty) | if type=="string" then . elif type=="array" then (.[0] // empty) else empty end' "${SYSTEM_FILE_PARAMETER_CACHE}" \
+      | awk 'NF { print; exit }'
+    )"
   fi
 fi
 export GITEE_TOKEN
