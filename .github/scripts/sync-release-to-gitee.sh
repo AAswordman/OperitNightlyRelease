@@ -27,14 +27,17 @@ urlencode() {
 
 gitee_release_id_by_tag() {
   local tag="$1"
-  local tag_q tmp code
+  local tag_q tmp code rid
   tag_q="$(urlencode "${tag}")"
   tmp="$(mktemp)"
   code="$(curl -sS -o "${tmp}" -w "%{http_code}" "${API_BASE}/releases/tags/${tag_q}?access_token=${GITEE_TOKEN}")"
   if [[ "${code}" == "200" ]]; then
-    jq -r '.id' "${tmp}"
-    rm -f "${tmp}"
-    return 0
+    rid="$(jq -r '.id // empty' "${tmp}")"
+    if [[ -n "${rid}" && "${rid}" != "null" ]]; then
+      echo "${rid}"
+      rm -f "${tmp}"
+      return 0
+    fi
   fi
   rm -f "${tmp}"
   return 1
@@ -200,4 +203,3 @@ case "${MODE}" in
     exit 1
     ;;
 esac
-
