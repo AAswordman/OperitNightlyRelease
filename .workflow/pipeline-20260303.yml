@@ -24,6 +24,8 @@ stages:
           - export SOURCE_GITHUB_REPOSITORY=AAswordman/OperitNightlyRelease
           - export GITEE_OWNER=AAswordman
           - export GITEE_REPO=OperitNightlyRelease
+          - echo "[debug] ci var names" && (env | cut -d= -f1 | grep -E '^(GITEE|REL_SYNC|SYNC_GITEE|SYSTEM_FILE_PARAMETER_CACHE|GITHUB_TOKEN)' || true)
+          - if [ -n "${SYSTEM_FILE_PARAMETER_CACHE:-}" ] && [ -f "${SYSTEM_FILE_PARAMETER_CACHE}" ]; then echo "[debug] parameter cache present"; jq -r 'paths(scalars) | map(tostring) | join(".")' "${SYSTEM_FILE_PARAMETER_CACHE}" | grep -Ei 'gitee|token|rel_sync|sync' | head -n 200 || true; else echo "[debug] parameter cache missing"; fi
           - bash .github/scripts/sync-release-to-gitee.sh latest
           - mkdir -p target
         artifacts:
