@@ -41,9 +41,22 @@ fi
 
 API_BASE="https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}"
 GH_API_BASE="https://api.github.com/repos/${SOURCE_GITHUB_REPOSITORY}"
+GH_RELEASE_MIRROR_PREFIXES_RAW="${GH_RELEASE_MIRROR_PREFIXES:-}"
+
+if [[ -n "${GH_RELEASE_MIRROR_PREFIXES_RAW}" ]]; then
+  IFS=',;' read -r -a GH_RELEASE_MIRROR_PREFIX_LIST <<<"${GH_RELEASE_MIRROR_PREFIXES_RAW}"
+else
+  GH_RELEASE_MIRROR_PREFIX_LIST=(
+    "https://flash.aaswordsman.org/"
+    "https://ghfast.top/"
+  )
+fi
 
 echo "Source GitHub repository: ${SOURCE_GITHUB_REPOSITORY}"
 echo "Target Gitee repository: ${GITEE_OWNER}/${GITEE_REPO}"
+if [[ "${#GH_RELEASE_MIRROR_PREFIX_LIST[@]}" -gt 0 ]]; then
+  echo "GitHub asset mirrors: ${GH_RELEASE_MIRROR_PREFIX_LIST[*]}"
+fi
 
 urlencode() {
   jq -rn --arg v "$1" '$v|@uri'
@@ -84,8 +97,30 @@ gh_api_get_json() {
 gh_download_asset() {
   local url="$1"
   local out="$2"
+  local attempt=0
+  local download_url
 
-  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  while IFS= read -r download_url; do
+    [[ -z "${download_url}" ]] && continue
+    attempt=$((attempt + 1))
+    echo "Download attempt ${attempt}: ${download_url}"
+
+    if gh_download_asset_once "${download_url}" "${out}"; then
+      return 0
+    fi
+
+    echo "Download attempt ${attempt} failed"
+  done < <(build_asset_download_candidates "${url}")
+
+  echo "All download attempts failed: ${url}" >&2
+  return 1
+}
+
+gh_download_asset_once() {
+  local url="$1"
+  local out="$2"
+
+  if [[ -n "${GITHUB_TOKEN:-}" ]] && [[ "${url}" == https://github.com/* || "${url}" == https://api.github.com/* || "${url}" == https://objects.githubusercontent.com/* || "${url}" == https://*.githubusercontent.com/* ]]; then
     curl -fsSL --retry 4 --retry-all-errors --retry-delay 2 \
       -H "Authorization: Bearer ${GITHUB_TOKEN}" \
       -H "Accept: application/octet-stream" \
@@ -97,6 +132,26 @@ gh_download_asset() {
       -L "${url}" \
       -o "${out}"
   fi
+}
+
+build_asset_download_candidates() {
+  local original_url="$1"
+  local prefix
+  local mirror_url
+
+  if [[ "${original_url}" == https://github.com/*/releases/download/* ]]; then
+    for prefix in "${GH_RELEASE_MIRROR_PREFIX_LIST[@]}"; do
+      prefix="${prefix//[[:space:]]/}"
+      [[ -z "${prefix}" ]] && continue
+      if [[ "${prefix}" != */ ]]; then
+        prefix="${prefix}/"
+      fi
+      mirror_url="${prefix}${original_url}"
+      printf '%s\n' "${mirror_url}"
+    done
+  fi
+
+  printf '%s\n' "${original_url}"
 }
 
 gitee_release_id_by_tag() {
