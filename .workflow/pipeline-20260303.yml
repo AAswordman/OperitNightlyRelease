@@ -27,14 +27,15 @@ stages:
           - export SOURCE_GITHUB_REPOSITORY=AAswordman/OperitNightlyRelease
           - export GITEE_OWNER=AAswordman
           - export GITEE_REPO=OperitNightlyRelease
-          - export GH_RELEASE_MIRROR_PREFIXES="https://gh-proxy.com/;https://ghfast.top/;https://flash.aaswordsman.org/"
+          - export GH_RELEASE_MIRROR_PREFIXES="https://gh.h233.eu.org/https://github.com;https://ghproxy.1888866.xyz/https://github.com;https://gh.ddlc.top/https://github.com;https://gh-proxy.com/https://github.com;https://cors.isteed.cc/github.com;https://hub.gitmirror.com/https://github.com;https://ghproxy.cfd/https://github.com;https://github.boki.moe/https://github.com;https://gh-proxy.net/https://github.com;https://gh.jasonzeng.dev/https://github.com;https://gh.monlor.com/https://github.com;https://fastgit.cc/https://github.com;https://github.tbedu.top/https://github.com;https://firewall.lxstd.org/https://github.com;https://github.ednovas.xyz/https://github.com;https://ghfile.geekertao.top/https://github.com;https://gh.chjina.com/https://github.com;https://ghpxy.hwinzniej.top/https://github.com;https://cdn.crashmc.com/https://github.com;https://git.yylx.win/https://github.com;https://gitproxy.mrhjx.cn/https://github.com;https://ghproxy.cxkpro.top/https://github.com;https://gh.xxooo.cf/https://github.com;https://github.limoruirui.com/https://github.com;https://gh.llkk.cc/https://github.com;https://down.npee.cn/?https://github.com;https://raw.ihtw.moe/github.com;https://xget.xi-xu.me/gh;https://dgithub.xyz;https://gh.nxnow.top/https://github.com;https://gh.zwy.one/https://github.com;https://ghproxy.monkeyray.net/https://github.com;https://gh.xx9527.cn/https://github.com;https://ghproxy.net/https://github.com;https://ghfast.top/https://github.com;https://wget.la/https://github.com;https://flash.aaswordsman.org/"
           - export SYNC_ASSET_CONCURRENCY=4
           - export SYNC_DOWNLOAD_STALL_SECONDS=5
           - export SYNC_DOWNLOAD_CONNECT_TIMEOUT=8
           - export SYNC_DOWNLOAD_PROBE_TIMEOUT=8
           - export SYNC_DOWNLOAD_PROBE_BYTES=262144
           - export SYNC_DOWNLOAD_MAX_ROUNDS=12
-          - echo "[debug] ci var names" && (env | cut -d= -f1 | grep -E '^(GITEE|REL_SYNC|SYNC_GITEE|SYSTEM_FILE_PARAMETER_CACHE|GITHUB_TOKEN|GH_RELEASE_MIRROR_PREFIXES|SYNC_ASSET_CONCURRENCY|SYNC_DOWNLOAD_)' || true)
+          - export SYNC_PROBE_CONCURRENCY=12
+          - echo "[debug] ci var names" && (env | cut -d= -f1 | grep -E '^(GITEE|REL_SYNC|SYNC_GITEE|SYSTEM_FILE_PARAMETER_CACHE|GITHUB_TOKEN|GH_RELEASE_MIRROR_PREFIXES|SYNC_ASSET_CONCURRENCY|SYNC_DOWNLOAD_|SYNC_PROBE_CONCURRENCY)' || true)
           - if [ -n "${SYSTEM_FILE_PARAMETER_CACHE:-}" ] && [ -f "${SYSTEM_FILE_PARAMETER_CACHE}" ]; then echo "[debug] parameter cache present"; jq -r 'paths(scalars) | map(tostring) | join(".")' "${SYSTEM_FILE_PARAMETER_CACHE}" | grep -Ei 'gitee|token|rel_sync|sync' | head -n 200 || true; else echo "[debug] parameter cache missing"; fi
           - bash .github/scripts/sync-release-to-gitee.sh latest
           - mkdir -p target

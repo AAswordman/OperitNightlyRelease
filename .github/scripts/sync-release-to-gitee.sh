@@ -48,6 +48,7 @@ SYNC_DOWNLOAD_CONNECT_TIMEOUT="${SYNC_DOWNLOAD_CONNECT_TIMEOUT:-8}"
 SYNC_DOWNLOAD_PROBE_TIMEOUT="${SYNC_DOWNLOAD_PROBE_TIMEOUT:-8}"
 SYNC_DOWNLOAD_PROBE_BYTES="${SYNC_DOWNLOAD_PROBE_BYTES:-262144}"
 SYNC_DOWNLOAD_MAX_ROUNDS="${SYNC_DOWNLOAD_MAX_ROUNDS:-12}"
+SYNC_PROBE_CONCURRENCY="${SYNC_PROBE_CONCURRENCY:-8}"
 
 if ! [[ "${SYNC_ASSET_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
   echo "SYNC_ASSET_CONCURRENCY must be a positive integer." >&2
@@ -73,6 +74,10 @@ if ! [[ "${SYNC_DOWNLOAD_MAX_ROUNDS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "SYNC_DOWNLOAD_MAX_ROUNDS must be a positive integer." >&2
   exit 1
 fi
+if ! [[ "${SYNC_PROBE_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SYNC_PROBE_CONCURRENCY must be a positive integer." >&2
+  exit 1
+fi
 
 if [[ -n "${GH_RELEASE_MIRROR_PREFIXES_RAW}" ]]; then
   IFS=',;' read -r -a GH_RELEASE_MIRROR_PREFIX_LIST <<<"${GH_RELEASE_MIRROR_PREFIXES_RAW}"
@@ -95,6 +100,7 @@ echo "Download connect timeout: ${SYNC_DOWNLOAD_CONNECT_TIMEOUT}"
 echo "Download probe timeout: ${SYNC_DOWNLOAD_PROBE_TIMEOUT}"
 echo "Download probe bytes: ${SYNC_DOWNLOAD_PROBE_BYTES}"
 echo "Download max rounds: ${SYNC_DOWNLOAD_MAX_ROUNDS}"
+echo "Probe concurrency: ${SYNC_PROBE_CONCURRENCY}"
 
 urlencode() {
   jq -rn --arg v "$1" '$v|@uri'
@@ -219,8 +225,9 @@ gh_download_asset() {
   local url="$1"
   local out="$2"
   local expected_size="${3:-0}"
-  local round best_url best_speed speed candidate resume_from actual_size
+  local round best_url best_speed speed candidate resume_from actual_size line
   local -a candidates
+  local -a probe_results
 
   touch "${out}"
   for ((round = 1; round <= SYNC_DOWNLOAD_MAX_ROUNDS; round++)); do
@@ -233,11 +240,12 @@ gh_download_asset() {
     best_url=""
     best_speed=-1
     echo "Probe round ${round}: selecting fastest source"
-    for candidate in "${candidates[@]}"; do
-      [[ -z "${candidate}" ]] && continue
-      speed="$(probe_download_speed "${candidate}")"
+    mapfile -t probe_results < <(probe_download_candidates_parallel "${candidates[@]}")
+    for line in "${probe_results[@]}"; do
+      speed="${line%%$'\t'*}"
+      candidate="${line#*$'\t'}"
       echo "Probe result: speed=${speed}B/s url=${candidate}"
-      if (( speed > best_speed )); then
+      if [[ "${speed}" =~ ^[0-9]+$ ]] && (( speed > best_speed )); then
         best_speed="${speed}"
         best_url="${candidate}"
       fi
@@ -271,21 +279,97 @@ gh_download_asset() {
 build_asset_download_candidates() {
   local original_url="$1"
   local prefix
-  local mirror_url
 
   if [[ "${original_url}" == https://github.com/*/releases/download/* ]]; then
-    for prefix in "${GH_RELEASE_MIRROR_PREFIX_LIST[@]}"; do
-      prefix="${prefix//[[:space:]]/}"
-      [[ -z "${prefix}" ]] && continue
-      if [[ "${prefix}" != */ ]]; then
-        prefix="${prefix}/"
-      fi
-      mirror_url="${prefix}${original_url}"
-      printf '%s\n' "${mirror_url}"
-    done
+    {
+      for prefix in "${GH_RELEASE_MIRROR_PREFIX_LIST[@]}"; do
+        prefix="${prefix//$'\r'/}"
+        prefix="${prefix//$'\n'/}"
+        prefix="$(echo "${prefix}" | awk '{$1=$1;print}')"
+        [[ -z "${prefix}" ]] && continue
+        build_mirror_candidate_url "${prefix}" "${original_url}"
+      done
+      printf '%s\n' "${original_url}"
+    } | awk 'NF && !seen[$0]++'
+    return 0
   fi
 
   printf '%s\n' "${original_url}"
+}
+
+build_mirror_candidate_url() {
+  local mirror_entry="$1"
+  local original_url="$2"
+  local candidate path_after_github
+
+  if [[ "${mirror_entry}" == *"{url}"* ]]; then
+    candidate="${mirror_entry//\{url\}/${original_url}}"
+  elif [[ "${mirror_entry}" == *"https://github.com"* ]]; then
+    candidate="${mirror_entry/https:\/\/github.com/${original_url}}"
+  elif [[ "${mirror_entry}" == *"github.com"* ]]; then
+    path_after_github="${original_url#https://github.com}"
+    candidate="${mirror_entry/github.com/github.com${path_after_github}}"
+  else
+    if [[ "${mirror_entry}" != */ && "${mirror_entry}" != *\?* ]]; then
+      mirror_entry="${mirror_entry}/"
+    fi
+    candidate="${mirror_entry}${original_url}"
+  fi
+
+  printf '%s\n' "${candidate}"
+}
+
+probe_download_candidates_parallel() {
+  local tmp_dir supports_wait_n running_jobs idx candidate speed
+  local -a pids
+
+  supports_wait_n=0
+  running_jobs=0
+  idx=0
+  pids=()
+  tmp_dir="$(mktemp -d)"
+
+  if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
+    supports_wait_n=1
+  fi
+
+  for candidate in "$@"; do
+    [[ -z "${candidate}" ]] && continue
+    idx=$((idx + 1))
+    {
+      speed="$(probe_download_speed "${candidate}")"
+      printf '%s\t%s\n' "${speed}" "${candidate}" > "${tmp_dir}/${idx}.txt"
+    } &
+    pids+=("$!")
+    running_jobs=$((running_jobs + 1))
+
+    if (( running_jobs >= SYNC_PROBE_CONCURRENCY )); then
+      if (( supports_wait_n == 1 )); then
+        wait -n || true
+      else
+        wait "${pids[0]}" || true
+        pids=("${pids[@]:1}")
+      fi
+      running_jobs=$((running_jobs - 1))
+    fi
+  done
+
+  if (( supports_wait_n == 1 )); then
+    while (( running_jobs > 0 )); do
+      wait -n || true
+      running_jobs=$((running_jobs - 1))
+    done
+  else
+    local pid
+    for pid in "${pids[@]}"; do
+      wait "${pid}" || true
+    done
+  fi
+
+  if compgen -G "${tmp_dir}/*.txt" > /dev/null; then
+    sort -t $'\t' -k1,1nr "${tmp_dir}"/*.txt
+  fi
+  rm -rf "${tmp_dir}"
 }
 
 gitee_release_id_by_tag() {
